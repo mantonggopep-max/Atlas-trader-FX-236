@@ -1,16 +1,14 @@
 import os
 import requests
 import pandas as pd
-import asyncio
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # =========================
 # CONFIG
 # =========================
-BOT_TOKEN = os.environ.get("BOT_TOKEN")  # set in Cloud Run / Render
-TWELVE_API_KEY = "37197ab71cbe450e89e9686c25769470"
-CHAT_ID = 595118215
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+TWELVE_API_KEY = os.environ["TWELVE_API_KEY"]
 
 SYMBOLS = {
     "XAUUSD": "XAU/USD",
@@ -22,7 +20,7 @@ SYMBOLS = {
 }
 
 TIMEFRAME = "5min"
-CANDLES = 120
+CANDLES = 100
 
 # =========================
 # DATA FETCH
@@ -30,7 +28,7 @@ CANDLES = 120
 def fetch_data(symbol):
     url = "https://api.twelvedata.com/time_series"
     params = {
-        "symbol": symbol,
+        "symbol": SYMBOLS[symbol],
         "interval": TIMEFRAME,
         "outputsize": CANDLES,
         "apikey": TWELVE_API_KEY
@@ -43,39 +41,34 @@ def fetch_data(symbol):
         return None
 
     df = pd.DataFrame(data["values"])
-    df = df.astype(float)
-    df = df.iloc[::-1].reset_index(drop=True)
+
+    price_cols = ["open", "high", "low", "close"]
+    df[price_cols] = df[price_cols].astype(float)
+    df["datetime"] = pd.to_datetime(df["datetime"])
+
+    df = df.sort_values("datetime").reset_index(drop=True)
     return df
 
 # =========================
-# SMC / ICT LOGIC
+# ICT / SMC ANALYSIS
 # =========================
-def market_structure(df):
-    df["swing_high"] = df["high"].rolling(5, center=True).max()
-    df["swing_low"] = df["low"].rolling(5, center=True).min()
-
-    last_close = df["close"].iloc[-1]
-    prev_swing_high = df["swing_high"].iloc[-6]
-    prev_swing_low = df["swing_low"].iloc[-6]
-
-    if last_close > prev_swing_high:
-        return "📈 Bullish MSB"
-    elif last_close < prev_swing_low:
-        return "📉 Bearish MSB"
-    else:
-        return None
-
 def analyze(symbol):
     df = fetch_data(symbol)
-    if df is None or len(df) < 50:
+    if df is None or len(df) < 20:
         return None
 
-    msb = market_structure(df)
-    if not msb:
-        return None
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
 
-    price = df["close"].iloc[-1]
-    return f"{msb}\nPrice: {price:.2f}"
+    signals = []
+
+    # Market Structure Break (simple & clean)
+    if last["close"] > prev["high"]:
+        signals.append(f"📈 {symbol} Bullish MSB\nEntry above {prev['high']:.2f}")
+    elif last["close"] < prev["low"]:
+        signals.append(f"📉 {symbol} Bearish MSB\nEntry below {prev['low']:.2f}")
+
+    return "\n".join(signals) if signals else None
 
 # =========================
 # TELEGRAM COMMANDS
@@ -83,47 +76,30 @@ def analyze(symbol):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📈 ATLAS FX Online\n"
-        "Use /scan to scan the market."
+        "Pairs: XAUUSD, XAGUSD, EURUSD, AUDUSD, EURJPY, US30\n"
+        "Use /scan to check market structure."
     )
 
 async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     messages = []
 
-    for name, symbol in SYMBOLS.items():
+    for symbol in SYMBOLS:
         result = analyze(symbol)
         if result:
-            messages.append(f"🔔 {name}\n{result}")
+            messages.append(result)
 
     if messages:
         await update.message.reply_text("\n\n".join(messages))
     else:
-        await update.message.reply_text("No valid SMC setups right now.")
-
-# =========================
-# AUTO SCAN (OPTIONAL)
-# =========================
-async def auto_scan(app):
-    while True:
-        for name, symbol in SYMBOLS.items():
-            result = analyze(symbol)
-            if result:
-                await app.bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=f"⚡ AUTO SIGNAL\n{name}\n{result}"
-                )
-        await asyncio.sleep(600)  # every 10 minutes
+        await update.message.reply_text("No valid ICT structure at the moment.")
 
 # =========================
 # MAIN
 # =========================
 if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("scan", scan))
 
-    # Uncomment for auto scanning
-    # app.job_queue.run_once(lambda _: asyncio.create_task(auto_scan(app)), 1)
-
-    print("ATLAS FX running...")
+    print("ATLAS FX Bot running...")
     app.run_polling()
