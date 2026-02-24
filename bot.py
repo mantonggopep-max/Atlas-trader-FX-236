@@ -1,85 +1,129 @@
 import os
-import asyncio
-import pytz
-import MetaTrader5 as mt5
+import requests
 import pandas as pd
+import asyncio
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# --- CONFIG ---
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-TELEGRAM_CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "595118215"))
-INSTRUMENTS = ["XAUUSD", "EURUSD", "AUDUSD", "EURJPY", "XAGUSD", "US30"]
-SCAN_INTERVAL = 300  # 5 minutes
+# =========================
+# CONFIG
+# =========================
+BOT_TOKEN = os.environ.get("BOT_TOKEN")  # set in Cloud Run / Render
+TWELVE_API_KEY = "37197ab71cbe450e89e9686c25769470"
+CHAT_ID = 595118215
 
-# --- MT5 INIT ---
-def start_mt5():
-    if not mt5.initialize():
-        print("MT5 Initialization Failed")
-        return False
-    return True
+SYMBOLS = {
+    "XAUUSD": "XAU/USD",
+    "XAGUSD": "XAG/USD",
+    "EURUSD": "EUR/USD",
+    "AUDUSD": "AUD/USD",
+    "EURJPY": "EUR/JPY",
+    "US30": "DJI"
+}
 
-# --- SMC / ICT LOGIC ---
-def analyze_instrument(symbol):
-    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 100)
-    if rates is None or len(rates) == 0:
+TIMEFRAME = "5min"
+CANDLES = 120
+
+# =========================
+# DATA FETCH
+# =========================
+def fetch_data(symbol):
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": symbol,
+        "interval": TIMEFRAME,
+        "outputsize": CANDLES,
+        "apikey": TWELVE_API_KEY
+    }
+
+    r = requests.get(url, params=params, timeout=10)
+    data = r.json()
+
+    if "values" not in data:
         return None
-    
-    df = pd.DataFrame(rates)
-    last_close = df['close'].iloc[-1]
-    prev_high = df['high'].iloc[-2]
-    prev_low = df['low'].iloc[-2]
 
-    signals = []
-    if last_close > prev_high:
-        signals.append(f"📈 {symbol} MSB Bullish")
-    elif last_close < prev_low:
-        signals.append(f"📉 {symbol} MSB Bearish")
-    return signals
+    df = pd.DataFrame(data["values"])
+    df = df.astype(float)
+    df = df.iloc[::-1].reset_index(drop=True)
+    return df
 
-# --- TELEGRAM HANDLERS ---
+# =========================
+# SMC / ICT LOGIC
+# =========================
+def market_structure(df):
+    df["swing_high"] = df["high"].rolling(5, center=True).max()
+    df["swing_low"] = df["low"].rolling(5, center=True).min()
+
+    last_close = df["close"].iloc[-1]
+    prev_swing_high = df["swing_high"].iloc[-6]
+    prev_swing_low = df["swing_low"].iloc[-6]
+
+    if last_close > prev_swing_high:
+        return "📈 Bullish MSB"
+    elif last_close < prev_swing_low:
+        return "📉 Bearish MSB"
+    else:
+        return None
+
+def analyze(symbol):
+    df = fetch_data(symbol)
+    if df is None or len(df) < 50:
+        return None
+
+    msb = market_structure(df)
+    if not msb:
+        return None
+
+    price = df["close"].iloc[-1]
+    return f"{msb}\nPrice: {price:.2f}"
+
+# =========================
+# TELEGRAM COMMANDS
+# =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📈 ATLAS FX Bot Online!\nUse /scan to scan instruments."
+        "📈 ATLAS FX Online\n"
+        "Use /scan to scan the market."
     )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("/start - Bot info\n/scan - Scan instruments")
-
 async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    all_signals = []
-    for symbol in INSTRUMENTS:
-        sigs = analyze_instrument(symbol)
-        if sigs:
-            all_signals.extend(sigs)
-    if all_signals:
-        await update.message.reply_text("\n".join(all_signals))
-    else:
-        await update.message.reply_text("No trade opportunities detected now.")
+    messages = []
 
-# --- AUTO SCAN ---
+    for name, symbol in SYMBOLS.items():
+        result = analyze(symbol)
+        if result:
+            messages.append(f"🔔 {name}\n{result}")
+
+    if messages:
+        await update.message.reply_text("\n\n".join(messages))
+    else:
+        await update.message.reply_text("No valid SMC setups right now.")
+
+# =========================
+# AUTO SCAN (OPTIONAL)
+# =========================
 async def auto_scan(app):
     while True:
-        all_signals = []
-        for symbol in INSTRUMENTS:
-            sigs = analyze_instrument(symbol)
-            if sigs:
-                all_signals.extend(sigs)
-        if all_signals:
-            for s in all_signals:
-                await app.bot.send_message(TELEGRAM_CHAT_ID, f"🟢 Auto Signal: {s}")
-        await asyncio.sleep(SCAN_INTERVAL)
+        for name, symbol in SYMBOLS.items():
+            result = analyze(symbol)
+            if result:
+                await app.bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=f"⚡ AUTO SIGNAL\n{name}\n{result}"
+                )
+        await asyncio.sleep(600)  # every 10 minutes
 
-# --- MAIN ---
+# =========================
+# MAIN
+# =========================
 if __name__ == "__main__":
-    if start_mt5():
-        app = ApplicationBuilder().token(BOT_TOKEN).build()
-        app.add_handler(CommandHandler("start", start))
-        app.add_handler(CommandHandler("help", help_command))
-        app.add_handler(CommandHandler("scan", scan))
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-        # Start auto scan in background
-        asyncio.create_task(auto_scan(app))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("scan", scan))
 
-        print("ATLAS FX Bot running...")
-        app.run_polling()
+    # Uncomment for auto scanning
+    # app.job_queue.run_once(lambda _: asyncio.create_task(auto_scan(app)), 1)
+
+    print("ATLAS FX running...")
+    app.run_polling()
